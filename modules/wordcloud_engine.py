@@ -13,7 +13,7 @@ PHASE = 3
 PRIORITY = 10
 NEEDS_DEEP = True
 DESCRIPTION = "BBOT-style WordCloud + NLP mutations"
-VERSION = "1.1"
+VERSION = "1.2"
 
 # Try wordninja — NLP-based word splitting (BBOT's secret weapon)
 try:

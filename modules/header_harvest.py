@@ -7,7 +7,7 @@ PHASE = 2
 PRIORITY = 30
 NEEDS_DEEP = True
 DESCRIPTION = "Merged into Web Scrape"
-VERSION = "1.1"
+VERSION = "1.2"
 
 def run(ctx):
     pass  # All work done in webscrape.py

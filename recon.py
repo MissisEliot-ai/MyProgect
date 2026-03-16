@@ -57,7 +57,7 @@ except ImportError:
 # GLOBALS
 # ─────────────────────────────────────────────────────────────
 _LOCKS = {"crtsh": threading.Lock()}
-VERSION = "1.1"
+VERSION = "1.2"
 
 # ─────────────────────────────────────────────────────────────
 # COLORS & LOGGING
@@ -1347,12 +1347,67 @@ def main():
         http_info = {}   # {host: [(status, url), ...]}
         dead_codes = {0, 404, 502, 503, 521, 522, 523, 530}
 
-        # Try httpx first (1000+/min)
+        # Try fast HTTP prober first (httpx by default, optional httprobe)
+        prober_mode = os.environ.get("RECON_HTTP_PROBER", "httpx").strip().lower()
         httpx_bin = BIN_HTTPX
+        httprobe_bin = find_binary("httprobe")
         httpx_attempted = False
         httpx_failed = False
 
-        if httpx_bin:
+        if prober_mode in ("httprobe", "auto") and httprobe_bin:
+            probe_max = int(os.environ.get("RECON_HTTP_PROBE_MAX", "0"))
+            probe_set = list(sorted(alive))
+            if probe_max > 0 and len(probe_set) > probe_max:
+                log(f"  HTTP probe capped: {probe_max}/{len(probe_set)} hosts", "warn")
+                probe_set = probe_set[:probe_max]
+
+            httprobe_batch_size = max(1000, int(os.environ.get("RECON_HTTPX_BATCH_SIZE", "50000")))
+            httprobe_batch_timeout = max(120, int(os.environ.get("RECON_HTTPX_BATCH_TIMEOUT", "600")))
+            total_probe = len(probe_set)
+            total_batches = (total_probe + httprobe_batch_size - 1) // httprobe_batch_size
+            log(f"  httprobe found: {httprobe_bin}", "info")
+
+            try:
+                httpx_attempted = True
+                for bi in range(total_batches):
+                    batch = probe_set[bi*httprobe_batch_size:(bi+1)*httprobe_batch_size]
+                    log(f"  httprobe batch {bi+1}/{total_batches}: {len(batch)} hosts", "info")
+
+                    tmp_in = os.path.join(out_dir, f"_probe_in_{bi}.txt")
+                    tmp_out = os.path.join(out_dir, f"_probe_out_{bi}.txt")
+                    save_txt(tmp_in, batch)
+
+                    subprocess.run([
+                        httprobe_bin,
+                        "-c", os.environ.get("RECON_HTTPX_THREADS", "200"),
+                        "-t", os.environ.get("RECON_HTTPX_TIMEOUT", "3000"),
+                        "-p", "https:443",
+                        "-p", "http:80",
+                        "-i", tmp_in,
+                        "-o", tmp_out
+                    ], timeout=httprobe_batch_timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    if Path(tmp_out).exists():
+                        with open(tmp_out) as f:
+                            for line in f:
+                                url = line.strip()
+                                if not url:
+                                    continue
+                                host_part = url.replace("https://", "").replace("http://", "").split("/")[0]
+                                host = host_part.split(":")[0]
+                                if host.endswith("." + domain) or host == domain:
+                                    http_info.setdefault(host, []).append((200, url))
+                                    http_alive.add(url)
+
+                    log(f"  httprobe progress: {min((bi+1)*httprobe_batch_size, total_probe)}/{total_probe}", "info")
+                    for fpath in (tmp_in, tmp_out):
+                        try: Path(fpath).unlink()
+                        except OSError: pass
+            except Exception as e:
+                httpx_failed = True
+                dbg(f"httprobe error: {e}")
+
+        elif httpx_bin:
             log(f"  httpx found: {httpx_bin}", "info")
             # Probe top web ports — finds hidden services on 8080, 8443, etc.
             PROBE_PORTS = "80,443,8080,8443,8888,9090,3000,4443,8000"
@@ -1367,6 +1422,12 @@ def main():
 
             httpx_batch_size = max(1000, int(os.environ.get("RECON_HTTPX_BATCH_SIZE", "50000")))
             httpx_batch_timeout = max(120, int(os.environ.get("RECON_HTTPX_BATCH_TIMEOUT", "600")))
+            httpx_threads = max(10, int(os.environ.get("RECON_HTTPX_THREADS", "200")))
+            httpx_rl = max(10, int(os.environ.get("RECON_HTTPX_RATE", "1000")))
+            httpx_timeout = max(1, int(os.environ.get("RECON_HTTPX_TIMEOUT", "3")))
+            httpx_retries = max(0, int(os.environ.get("RECON_HTTPX_RETRIES", "0")))
+            httpx_nfs = os.environ.get("RECON_HTTPX_NFS", "1") == "1"
+            httpx_scheme_mode = os.environ.get("RECON_HTTPX_SCHEME_MODE", "host").strip().lower()
             total_probe = len(probe_set)
             total_batches = (total_probe + httpx_batch_size - 1) // httpx_batch_size
 
@@ -1379,15 +1440,30 @@ def main():
 
                     tmp_in = os.path.join(out_dir, f"_probe_in_{bi}.txt")
                     tmp_out = os.path.join(out_dir, f"_probe_out_{bi}.txt")
-                    save_txt(tmp_in, batch)
+                    if httpx_scheme_mode in ("https", "http", "both"):
+                        prepared = []
+                        for host in batch:
+                            if httpx_scheme_mode in ("https", "both"):
+                                prepared.append(f"https://{host}")
+                            if httpx_scheme_mode in ("http", "both"):
+                                prepared.append(f"http://{host}")
+                        save_txt(tmp_in, prepared)
+                    else:
+                        save_txt(tmp_in, batch)
 
                     # Run WITHOUT -fc — capture ALL responses for http_full
-                    subprocess.run([
+                    cmd = [
                         httpx_bin, "-l", tmp_in, "-o", tmp_out,
-                        "-t", "100", "-timeout", "3",
+                        "-t", str(httpx_threads),
+                        "-rl", str(httpx_rl),
+                        "-timeout", str(httpx_timeout),
+                        "-retries", str(httpx_retries),
                         "-p", PROBE_PORTS,
                         "-sc", "-silent", "-no-color"
-                    ], timeout=httpx_batch_timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    ]
+                    if httpx_nfs and httpx_scheme_mode in ("https", "http", "both"):
+                        cmd.append("-nfs")
+                    subprocess.run(cmd, timeout=httpx_batch_timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                     if Path(tmp_out).exists():
                         with open(tmp_out) as f:
