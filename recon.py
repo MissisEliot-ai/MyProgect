@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -203,14 +204,28 @@ def crtsh_extract(data, domain):
 RESOLVERS = ["8.8.8.8","1.1.1.1","9.9.9.9","208.67.222.222","8.8.4.4",
              "1.0.0.1","149.112.112.112","208.67.220.220"]
 
+def _candidate_resolver_files():
+    """Return resolver file paths in lookup order."""
+    root = Path(__file__).parent
+    return [
+        root / "resolvers.txt",              # legacy location (next to recon.py)
+        root / "modules" / "resolvers.txt", # current project layout
+    ]
+
+
 def load_resolvers():
-    """Load resolvers from resolvers.txt if exists."""
+    """Load resolvers from resolvers.txt if it exists in known locations."""
     global RESOLVERS
-    rfile = Path(__file__).parent / "resolvers.txt"
-    if rfile.exists():
+    for rfile in _candidate_resolver_files():
+        if not rfile.exists():
+            continue
         loaded = [l.strip() for l in rfile.read_text().splitlines() if l.strip() and not l.startswith("#")]
         if loaded:
             RESOLVERS = loaded
+            dbg(f"Loaded {len(loaded)} resolvers from {rfile}")
+            return str(rfile)
+    dbg("No resolvers.txt found in known locations, using built-in defaults")
+    return None
 
 load_resolvers()
 
@@ -269,25 +284,19 @@ def massdns_resolve(candidates, domain, resolvers_file=None):
     """Bulk resolve via massdns if installed. Returns set of resolved subdomains.
     Falls back to None if massdns not available."""
     if resolvers_file is None:
-        resolvers_file = str(Path(__file__).parent / "resolvers.txt")
-    if not Path(resolvers_file).exists():
+        for candidate in _candidate_resolver_files():
+            if candidate.exists():
+                resolvers_file = str(candidate)
+                break
+    if not resolvers_file or not Path(resolvers_file).exists():
+        dbg("massdns skipped: resolvers.txt not found")
         return None
 
-    # Find massdns binary — check local dir first, then PATH
-    massdns_bin = None
-    script_dir = Path(__file__).parent
-    for name in ["massdns.exe", "massdns"]:
-        local = script_dir / name
-        if local.exists():
-            massdns_bin = str(local)
-            break
+    # Find massdns binary with shared detection logic
+    massdns_bin = find_binary("massdns")
     if massdns_bin is None:
-        try:
-            subprocess.run(["massdns", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            massdns_bin = "massdns"
-        except (FileNotFoundError, Exception):
-            dbg("massdns not found in PATH or local directory")
-            return None
+        dbg("massdns not found in known tool dirs or PATH")
+        return None
 
     dbg(f"massdns found: {massdns_bin}")
 
@@ -333,18 +342,50 @@ def massdns_resolve(candidates, domain, resolvers_file=None):
 # ─────────────────────────────────────────────────────────────
 # EXTERNAL TOOL DETECTION + INTEGRATION
 # ─────────────────────────────────────────────────────────────
+def _tool_search_dirs():
+    """Directories to scan for external tools (Windows-friendly)."""
+    root = Path(__file__).parent
+    dirs = [
+        root,
+        root / "tools",
+        root / "bin",
+        root / "modules" / "tools",
+    ]
+    # Optional custom dirs: RECON_TOOLS_DIR="C:\tools;D:\sec" on Windows
+    env_dirs = os.environ.get("RECON_TOOLS_DIR", "")
+    if env_dirs:
+        for raw in env_dirs.split(os.pathsep):
+            raw = raw.strip().strip('"')
+            if raw:
+                dirs.append(Path(raw))
+    # keep order, drop duplicates
+    seen = set()
+    uniq = []
+    for d in dirs:
+        key = str(d.resolve()) if d.exists() else str(d)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(d)
+    return uniq
+
+
 def find_binary(name):
-    """Find binary in script dir first, then PATH. Returns path or None."""
-    script_dir = Path(__file__).parent
-    for ext in [".exe", ""]:
-        local = script_dir / (name + ext)
-        if local.exists():
-            return str(local)
-    try:
-        subprocess.run([name, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-        return name
-    except (FileNotFoundError, Exception):
-        return None
+    """Find binary in project dirs first, then PATH. Returns path or None."""
+    exts = [".exe", ".bat", ".cmd", ""] if os.name == "nt" else [""]
+
+    # 1) Project-local locations (portable bundles)
+    for d in _tool_search_dirs():
+        for ext in exts:
+            local = d / (name + ext)
+            if local.exists() and local.is_file():
+                return str(local)
+
+    # 2) PATH via shutil.which (supports PATHEXT on Windows)
+    for ext in exts:
+        hit = shutil.which(name + ext)
+        if hit:
+            return hit
+    return None
 
 # Detect all binaries at import time
 BIN_DNSX = find_binary("dnsx")
@@ -950,11 +991,13 @@ def main():
                 wl_found = set()
                 est_lines = int(wl_size_mb * 100000)
                 wl_timeout = max(300, int(est_lines / 2000))
-                resolvers_file = str(Path(__file__).parent / "resolvers.txt")
+                resolvers_file = next((str(p) for p in _candidate_resolver_files() if p.exists()), "")
+                if not resolvers_file:
+                    log(f"  Wordlist brute: resolvers.txt not found, massdns skipped", "warn")
 
                 # === Strategy 1: massdns (OneForAll-style flags) ===
                 massdns_bin = find_binary("massdns")
-                if massdns_bin:
+                if massdns_bin and resolvers_file:
                     log(f"  Using massdns (timeout: {wl_timeout}s)...", "info")
                     output_file = candidates_file + ".out"
                     try:

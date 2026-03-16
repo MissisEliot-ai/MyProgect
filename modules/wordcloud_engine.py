@@ -69,7 +69,9 @@ def _split_word(word):
 def _build_cloud(found_subs, domain):
     """Build word frequency cloud from all found subdomains."""
     cloud = {}
-    for sub in found_subs:
+    # Snapshot to avoid "set changed size during iteration" when Phase 3 modules
+    # run in parallel and mutate ctx["found_subs"].
+    for sub in list(found_subs):
         # Strip domain suffix
         prefix = sub.replace(f".{domain}", "")
         # Split each level
@@ -88,7 +90,7 @@ def _generate_mutations(cloud, found_subs, domain):
     """Generate mutation candidates from WordCloud."""
     candidates = set()
     existing_prefixes = set()
-    for sub in found_subs:
+    for sub in list(found_subs):
         prefix = sub.replace(f".{domain}", "")
         existing_prefixes.add(prefix)
 
@@ -154,7 +156,8 @@ def _generate_mutations(cloud, found_subs, domain):
 
 def run(ctx):
     domain = ctx["domain"]
-    found = ctx["found_subs"]
+    # Snapshot shared set (other Phase 3 modules run concurrently)
+    found = set(ctx["found_subs"])
     resolve_one = ctx["resolve_one"]
     log, c_fn = ctx["log"], ctx["c"]
 

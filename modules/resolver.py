@@ -6,6 +6,7 @@ Checks wildcard at EVERY parent level, not just root.
 import random
 import string
 import concurrent.futures
+import os
 
 NAME = "DNS Resolver"
 PHASE = 4
@@ -88,13 +89,15 @@ def run(ctx):
         """Check if subdomain's IPs match any of its parent wildcards."""
         if not wildcard_map:
             return False
-        ip_set = set(ips) if isinstance(ips, (list, tuple)) else {ips}
+        ip_set = set(ips) if isinstance(ips, (list, tuple)) else ({ips} if ips else set())
+        # No IP evidence -> cannot confidently classify as wildcard.
+        if not ip_set:
+            return False
         parts = sub.split(".")
         for i in range(1, len(parts)):
             parent = ".".join(parts[i:])
-            if parent in wildcard_map:
-                if ip_set.issubset(wildcard_map[parent]):
-                    return True
+            if parent in wildcard_map and ip_set.issubset(wildcard_map[parent]):
+                return True
         return False
 
     to_remove = set()
@@ -125,13 +128,10 @@ def run(ctx):
         massdns_result = massdns_resolve(unresolved, domain)
         if massdns_result is not None:
             for sub in massdns_result:
-                ips = [sub]  # massdns_resolve returns set of names, not IPs
-                # We know it resolved — mark as alive with placeholder
-                if not _is_wildcard(sub, []):
-                    ctx["resolved"][sub] = ["massdns"]
-                    resolved_count += 1
-                else:
-                    ctx["found_subs"].discard(sub)
+                # massdns confirms that hostname resolves, but does not provide
+                # trusted IP data in this code path, so keep a marker value.
+                ctx["resolved"][sub] = ["massdns"]
+                resolved_count += 1
             still_unresolved = [s for s in unresolved if s not in ctx["resolved"]]
             log(f"  massdns: {resolved_count} alive, {len(still_unresolved)} remain")
             unresolved = still_unresolved
@@ -186,6 +186,12 @@ def run(ctx):
     # Removes DNS-poisoned results from dodgy public resolvers
     TRUSTED = ["8.8.8.8", "1.1.1.1"]
     resolved_hosts = list(ctx["resolved"].keys())
+    max_validate = int(os.environ.get("RECON_TRUSTED_VALIDATE_MAX", "15000"))
+    if len(resolved_hosts) > max_validate:
+        # Large runs can stall for a long time here; validate a representative sample.
+        random.shuffle(resolved_hosts)
+        log(f"  Trusted validation capped: {max_validate}/{len(ctx['resolved'])} hosts", "warn")
+        resolved_hosts = resolved_hosts[:max_validate]
     if len(resolved_hosts) > 3:
         try:
             import dns.resolver as _dns_r
