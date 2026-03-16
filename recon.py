@@ -1348,6 +1348,8 @@ def main():
 
         # Try httpx first (1000+/min)
         httpx_bin = BIN_HTTPX
+        httpx_attempted = False
+        httpx_failed = False
 
         if httpx_bin:
             log(f"  httpx found: {httpx_bin}", "info")
@@ -1369,6 +1371,7 @@ def main():
 
             import tempfile
             try:
+                httpx_attempted = True
                 for bi in range(total_batches):
                     batch = probe_set[bi*httpx_batch_size:(bi+1)*httpx_batch_size]
                     log(f"  httpx batch {bi+1}/{total_batches}: {len(batch)} hosts", "info")
@@ -1412,13 +1415,20 @@ def main():
                         try: Path(fpath).unlink()
                         except OSError: pass
             except Exception as e:
+                httpx_failed = True
                 dbg(f"httpx error: {e}")
-        
+
         # Fallback: fast HEAD requests, 100 threads, 2s timeout
-        # Calculate which hosts haven't been probed yet
+        # Avoid huge fallback scans when httpx already ran but returned nothing.
         probed_hosts = set(http_info.keys())
-        if not httpx_bin or not probed_hosts:
+        force_head_after_httpx = os.environ.get("RECON_HEAD_PROBE_ON_HTTPX_EMPTY", "0") == "1"
+        do_head_probe = (not httpx_bin) or (not probed_hosts and (httpx_failed or not httpx_attempted or force_head_after_httpx))
+        if do_head_probe:
             remaining = alive - probed_hosts if probed_hosts else alive
+            head_probe_max = max(0, int(os.environ.get("RECON_HEAD_PROBE_MAX", "20000")))
+            if head_probe_max > 0 and len(remaining) > head_probe_max:
+                log(f"  HEAD probe capped: {head_probe_max}/{len(remaining)} hosts", "warn")
+                remaining = set(sorted(remaining)[:head_probe_max])
             log(f"  HEAD probe {len(remaining)} hosts (100 threads, 2s timeout)...", "info")
 
             if HAS_REQUESTS:
@@ -1457,6 +1467,8 @@ def main():
                         http_info.setdefault(sub, []).append((status, url))
             if len(remaining) > 200:
                 print()
+        elif httpx_bin and not probed_hosts:
+            log("  HEAD fallback skipped (httpx returned no hosts); set RECON_HEAD_PROBE_ON_HTTPX_EMPTY=1 to force", "warn")
 
         # http_alive.txt — only good URLs (open in browser)
         p_http = os.path.join(out_dir, "http_alive.txt")
