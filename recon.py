@@ -1343,11 +1343,6 @@ def main():
         http_info = {}   # {host: [(status, url), ...]}
         dead_codes = {0, 404, 502, 503, 521, 522, 523, 530}
 
-        # Write alive to temp file for httpx
-        import tempfile
-        tmp_in = os.path.join(out_dir, "_probe_in.txt")
-        save_txt(tmp_in, alive)
-
         # Try httpx first (1000+/min)
         httpx_bin = BIN_HTTPX
 
@@ -1356,38 +1351,63 @@ def main():
             # Probe top web ports — finds hidden services on 8080, 8443, etc.
             PROBE_PORTS = "80,443,8080,8443,8888,9090,3000,4443,8000"
             log(f"  Ports: {PROBE_PORTS}", "info")
-            tmp_out = os.path.join(out_dir, "_probe_out.txt")
+
+            # Optional safety cap for very large runs
+            probe_max = int(os.environ.get("RECON_HTTP_PROBE_MAX", "0"))
+            probe_set = list(sorted(alive))
+            if probe_max > 0 and len(probe_set) > probe_max:
+                log(f"  HTTP probe capped: {probe_max}/{len(probe_set)} hosts", "warn")
+                probe_set = probe_set[:probe_max]
+
+            httpx_batch_size = max(1000, int(os.environ.get("RECON_HTTPX_BATCH_SIZE", "50000")))
+            httpx_batch_timeout = max(120, int(os.environ.get("RECON_HTTPX_BATCH_TIMEOUT", "600")))
+            total_probe = len(probe_set)
+            total_batches = (total_probe + httpx_batch_size - 1) // httpx_batch_size
+
+            import tempfile
             try:
-                # Run WITHOUT -fc — capture ALL responses for http_full
-                subprocess.run([
-                    httpx_bin, "-l", tmp_in, "-o", tmp_out,
-                    "-t", "100", "-timeout", "3",
-                    "-p", PROBE_PORTS,
-                    "-sc", "-silent", "-no-color"
-                ], timeout=600, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if Path(tmp_out).exists():
-                    with open(tmp_out) as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            url = line.split(" [")[0].strip() if " [" in line else line
-                            status = 0
-                            if " [" in line:
-                                try:
-                                    status = int(line.split(" [")[1].rstrip("]").strip())
-                                except ValueError:
-                                    pass
-                            host_part = url.replace("https://", "").replace("http://", "").split("/")[0]
-                            host = host_part.split(":")[0]
-                            if host.endswith("." + domain) or host == domain:
-                                # ALL go to http_info (for http_full.txt)
-                                http_info.setdefault(host, []).append((status, url))
-                                # Only non-dead go to http_alive
-                                if status and status not in dead_codes:
-                                    http_alive.add(url)
-                    try: Path(tmp_out).unlink()
-                    except OSError: pass
+                for bi in range(total_batches):
+                    batch = probe_set[bi*httpx_batch_size:(bi+1)*httpx_batch_size]
+                    log(f"  httpx batch {bi+1}/{total_batches}: {len(batch)} hosts", "info")
+
+                    tmp_in = os.path.join(out_dir, f"_probe_in_{bi}.txt")
+                    tmp_out = os.path.join(out_dir, f"_probe_out_{bi}.txt")
+                    save_txt(tmp_in, batch)
+
+                    # Run WITHOUT -fc — capture ALL responses for http_full
+                    subprocess.run([
+                        httpx_bin, "-l", tmp_in, "-o", tmp_out,
+                        "-t", "100", "-timeout", "3",
+                        "-p", PROBE_PORTS,
+                        "-sc", "-silent", "-no-color"
+                    ], timeout=httpx_batch_timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    if Path(tmp_out).exists():
+                        with open(tmp_out) as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                url = line.split(" [")[0].strip() if " [" in line else line
+                                status = 0
+                                if " [" in line:
+                                    try:
+                                        status = int(line.split(" [")[1].rstrip("]").strip())
+                                    except ValueError:
+                                        pass
+                                host_part = url.replace("https://", "").replace("http://", "").split("/")[0]
+                                host = host_part.split(":")[0]
+                                if host.endswith("." + domain) or host == domain:
+                                    # ALL go to http_info (for http_full.txt)
+                                    http_info.setdefault(host, []).append((status, url))
+                                    # Only non-dead go to http_alive
+                                    if status and status not in dead_codes:
+                                        http_alive.add(url)
+
+                    log(f"  httpx progress: {min((bi+1)*httpx_batch_size, total_probe)}/{total_probe}", "info")
+                    for fpath in (tmp_in, tmp_out):
+                        try: Path(fpath).unlink()
+                        except OSError: pass
             except Exception as e:
                 dbg(f"httpx error: {e}")
         
@@ -1452,8 +1472,7 @@ def main():
                     total_urls += 1
         log(f"  {c(p_full,'cyan')} — {total_urls} URLs (все ответы, включая 5xx)", "info")
 
-        try: Path(tmp_in).unlink()
-        except OSError: pass
+        # temp probe files are cleaned per-batch above
     elif alive and not args.probe:
         log(f"  Совет: {c('--probe','bold')} для HTTP проверки alive хостов", "info")
 
