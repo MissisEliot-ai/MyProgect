@@ -1,0 +1,232 @@
+"""
+Resolver — DNS validation with BBOT-style multi-level wildcard detection.
+Checks wildcard at EVERY parent level, not just root.
+*.test-main.proginn.com, *.prod.proginn.com etc. are detected and filtered.
+"""
+import random
+import string
+import concurrent.futures
+
+NAME = "DNS Resolver"
+PHASE = 4
+PRIORITY = 10
+NEEDS_DEEP = False
+DESCRIPTION = "Multi-level wildcard detection + mass DNS resolve"
+
+def run(ctx):
+    domain = ctx["domain"]
+    found = ctx["found_subs"]
+    resolve_one = ctx["resolve_one"]
+    log, c = ctx["log"], ctx["c"]
+
+    if not found:
+        return
+
+    # ── 1. Collect all unique parent zones from found subdomains ──
+    parents = set()
+    parents.add(domain)
+    for sub in found:
+        parts = sub.split(".")
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[i:])
+            if parent.endswith("." + domain) or parent == domain:
+                parents.add(parent)
+
+    # Cap parents to prevent slowdown with large wordlists
+    if len(parents) > 1000:
+        # Keep shortest (most important) parents
+        parents = set(sorted(parents, key=len)[:1000])
+
+    log(f"  Checking {len(parents)} zones for wildcards...")
+
+    # ── 2. Test each parent for wildcard (parallel) ──
+    wildcard_map = {}  # {parent: set(ips)}
+
+    def _check_wildcard(parent):
+        rand = ''.join(random.choices(string.ascii_lowercase, k=12))
+        test_host = f"{rand}.{parent}"
+        result = resolve_one(test_host, timeout=3)
+        if result:
+            return parent, set(result[1])
+        return parent, None
+
+    threads = min(200, len(parents))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = {ex.submit(_check_wildcard, p): p for p in parents}
+        for future in concurrent.futures.as_completed(futures):
+            parent, ips = future.result()
+            if ips:
+                wildcard_map[parent] = ips
+
+    if wildcard_map:
+        # Double-check wildcards with second random query (avoid false positives)
+        confirmed = {}
+        for parent, ips1 in wildcard_map.items():
+            rand2 = ''.join(random.choices(string.ascii_lowercase, k=14))
+            result2 = resolve_one(f"{rand2}.{parent}", timeout=3)
+            if result2:
+                ips2 = set(result2[1])
+                # Both random queries resolved — confirmed wildcard
+                confirmed[parent] = ips1 | ips2
+        wildcard_map = confirmed
+
+    if wildcard_map:
+        log(f"  Wildcards found at {c(str(len(wildcard_map)),'yellow')} levels:", "warn")
+        for parent in sorted(wildcard_map.keys()):
+            log(f"    *.{parent} → {wildcard_map[parent]}", "warn")
+        # Merge all wildcard IPs for ctx
+        all_wc_ips = set()
+        for ips in wildcard_map.values():
+            all_wc_ips.update(ips)
+        ctx["wildcard_ips"] = all_wc_ips
+    else:
+        log(f"  No wildcards detected ✓")
+        ctx["wildcard_ips"] = set()
+
+    # ── 3. Filter already-resolved subs against wildcard parents ──
+    def _is_wildcard(sub, ips):
+        """Check if subdomain's IPs match any of its parent wildcards."""
+        if not wildcard_map:
+            return False
+        ip_set = set(ips) if isinstance(ips, (list, tuple)) else {ips}
+        parts = sub.split(".")
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[i:])
+            if parent in wildcard_map:
+                if ip_set.issubset(wildcard_map[parent]):
+                    return True
+        return False
+
+    to_remove = set()
+    for sub, ips in list(ctx["resolved"].items()):
+        if _is_wildcard(sub, ips):
+            to_remove.add(sub)
+
+    if to_remove:
+        ctx["found_subs"] -= to_remove
+        for sub in to_remove:
+            ctx["resolved"].pop(sub, None)
+        log(f"  Removed {c(str(len(to_remove)),'yellow')} wildcard subs from resolved")
+
+    # ── 4. Mass resolve remaining — massdns first, dnsx second, ThreadPool last ──
+    found = ctx["found_subs"]  # refresh after filtering
+    unresolved = [s for s in found if s not in ctx["resolved"]]
+    if not unresolved:
+        log(f"  All {len(found)} subs already resolved")
+        return
+
+    log(f"  Resolving {len(unresolved)} remaining subs...")
+    resolved_count = 0
+
+    # Try massdns first (fastest for large sets)
+    massdns_resolve = ctx.get("massdns_resolve")
+    if massdns_resolve and len(unresolved) > 100:
+        log(f"  Using massdns for {len(unresolved)} subs...")
+        massdns_result = massdns_resolve(unresolved, domain)
+        if massdns_result is not None:
+            for sub in massdns_result:
+                ips = [sub]  # massdns_resolve returns set of names, not IPs
+                # We know it resolved — mark as alive with placeholder
+                if not _is_wildcard(sub, []):
+                    ctx["resolved"][sub] = ["massdns"]
+                    resolved_count += 1
+                else:
+                    ctx["found_subs"].discard(sub)
+            still_unresolved = [s for s in unresolved if s not in ctx["resolved"]]
+            log(f"  massdns: {resolved_count} alive, {len(still_unresolved)} remain")
+            unresolved = still_unresolved
+
+    # Try dnsx second (gets actual IPs)
+    dnsx_resolve = ctx.get("dnsx_resolve")
+    if dnsx_resolve and unresolved:
+        log(f"  Using dnsx for {len(unresolved)} subs...")
+        dnsx_result = dnsx_resolve(unresolved, domain)
+        if dnsx_result:
+            for sub, ips in dnsx_result.items():
+                if _is_wildcard(sub, ips):
+                    ctx["found_subs"].discard(sub)
+                    continue
+                ctx["resolved"][sub] = ips
+                resolved_count += 1
+            still_unresolved = [s for s in unresolved if s not in ctx["resolved"]]
+            if still_unresolved:
+                log(f"  dnsx: +{len(dnsx_result)}, {len(still_unresolved)} remain")
+            unresolved = still_unresolved
+
+    # Fallback: ThreadPool for remaining (small batches only)
+    if unresolved and len(unresolved) <= 5000:
+        threads = min(200, len(unresolved))
+        log(f"  ThreadPool ({threads} threads) for {len(unresolved)} remaining...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            futures = {ex.submit(resolve_one, sub): sub for sub in unresolved}
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                done += 1
+                if done % 500 == 0:
+                    print(f"\r  {done}/{len(unresolved)} resolving...     ", end="", flush=True)
+                result = future.result()
+                if result:
+                    sub, ips = result
+                    if _is_wildcard(sub, ips):
+                        ctx["found_subs"].discard(sub)
+                        continue
+                    ctx["resolved"][sub] = ips
+                    resolved_count += 1
+        if len(unresolved) > 500:
+            print()
+    elif unresolved:
+        log(f"  Skipping {len(unresolved)} unresolved (too many for ThreadPool, need massdns/dnsx)")
+
+    alive = len(ctx["resolved"])
+    total = len(ctx["found_subs"])
+    log(f"  Resolved: {c(str(alive),'green')} alive / {total} total")
+
+    # ── 5. Trusted resolver validation (anti-poisoning) ──
+    # Re-check all resolved hosts against 8.8.8.8 and 1.1.1.1
+    # Removes DNS-poisoned results from dodgy public resolvers
+    TRUSTED = ["8.8.8.8", "1.1.1.1"]
+    resolved_hosts = list(ctx["resolved"].keys())
+    if len(resolved_hosts) > 3:
+        try:
+            import dns.resolver as _dns_r
+        except ImportError:
+            log(f"  Trusted validation skipped (dnspython not installed)")
+            return
+
+        log(f"  Validating {len(resolved_hosts)} hosts via trusted resolvers...")
+
+        def _trusted_check(sub):
+            for ns in TRUSTED:
+                try:
+                    r = _dns_r.Resolver()
+                    r.nameservers = [ns]
+                    r.lifetime = 3
+                    answers = r.resolve(sub, "A", lifetime=3)
+                    return sub, [str(a) for a in answers]
+                except Exception:
+                    continue
+            return sub, None
+
+        poisoned = set()
+        threads = min(200, len(resolved_hosts))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            futures = {ex.submit(_trusted_check, sub): sub for sub in resolved_hosts}
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                done += 1
+                if done % 500 == 0:
+                    print(f"\r  Validating: {done}/{len(resolved_hosts)}...     ", end="", flush=True)
+                sub, trusted_ips = future.result()
+                if trusted_ips is None:
+                    # Trusted resolvers say NXDOMAIN — was poisoned!
+                    poisoned.add(sub)
+        if len(resolved_hosts) > 500:
+            print()
+
+        if poisoned:
+            for sub in poisoned:
+                ctx["resolved"].pop(sub, None)
+                ctx["found_subs"].discard(sub)
+            log(f"  Removed {c(str(len(poisoned)),'yellow')} DNS-poisoned results", "warn")
+        else:
+            log(f"  Trusted validation: all clean ✓")
