@@ -10,6 +10,7 @@ PHASE = 2
 PRIORITY = 50
 NEEDS_DEEP = True
 DESCRIPTION = "Reverse DNS on all discovered IPs"
+VERSION = "1.1"
 
 def run(ctx):
     domain = ctx["domain"]

@@ -13,6 +13,7 @@ PHASE = 2
 PRIORITY = 40
 NEEDS_DEEP = True
 DESCRIPTION = "GA/GTM/Pixel ID → linked domains"
+VERSION = "1.1"
 
 # Tracking ID patterns
 TRACKING_PATTERNS = [

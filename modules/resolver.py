@@ -13,6 +13,7 @@ PHASE = 4
 PRIORITY = 10
 NEEDS_DEEP = False
 DESCRIPTION = "Multi-level wildcard detection + mass DNS resolve"
+VERSION = "1.1"
 
 def run(ctx):
     domain = ctx["domain"]
