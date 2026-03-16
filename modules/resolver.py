@@ -6,6 +6,7 @@ Checks wildcard at EVERY parent level, not just root.
 import random
 import string
 import concurrent.futures
+import os
 
 NAME = "DNS Resolver"
 PHASE = 4
@@ -53,21 +54,47 @@ def run(ctx):
     threads = min(200, len(parents))
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
         futures = {ex.submit(_check_wildcard, p): p for p in parents}
+        done = 0
         for future in concurrent.futures.as_completed(futures):
+            done += 1
+            if done % 200 == 0:
+                print(f"\r  Wildcard probe: {done}/{len(parents)}...     ", end="", flush=True)
             parent, ips = future.result()
             if ips:
                 wildcard_map[parent] = ips
+    if len(parents) > 200:
+        print()
 
     if wildcard_map:
         # Double-check wildcards with second random query (avoid false positives)
+        # Parallelized: sequential confirmation can be very slow on large runs.
         confirmed = {}
-        for parent, ips1 in wildcard_map.items():
+
+        def _confirm_wildcard(item):
+            parent, ips1 = item
             rand2 = ''.join(random.choices(string.ascii_lowercase, k=14))
-            result2 = resolve_one(f"{rand2}.{parent}", timeout=3)
+            result2 = resolve_one(f"{rand2}.{parent}", timeout=2)
             if result2:
                 ips2 = set(result2[1])
                 # Both random queries resolved — confirmed wildcard
-                confirmed[parent] = ips1 | ips2
+                return parent, (ips1 | ips2)
+            return parent, None
+
+        items = list(wildcard_map.items())
+        threads2 = min(200, len(items))
+        done2 = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads2) as ex:
+            futures2 = {ex.submit(_confirm_wildcard, item): item[0] for item in items}
+            for future in concurrent.futures.as_completed(futures2):
+                done2 += 1
+                if done2 % 200 == 0:
+                    print(f"\r  Confirming wildcards: {done2}/{len(items)}...     ", end="", flush=True)
+                parent, merged_ips = future.result()
+                if merged_ips:
+                    confirmed[parent] = merged_ips
+        if len(items) > 200:
+            print()
+
         wildcard_map = confirmed
 
     if wildcard_map:
@@ -88,13 +115,15 @@ def run(ctx):
         """Check if subdomain's IPs match any of its parent wildcards."""
         if not wildcard_map:
             return False
-        ip_set = set(ips) if isinstance(ips, (list, tuple)) else {ips}
+        ip_set = set(ips) if isinstance(ips, (list, tuple)) else ({ips} if ips else set())
+        # No IP evidence -> cannot confidently classify as wildcard.
+        if not ip_set:
+            return False
         parts = sub.split(".")
         for i in range(1, len(parts)):
             parent = ".".join(parts[i:])
-            if parent in wildcard_map:
-                if ip_set.issubset(wildcard_map[parent]):
-                    return True
+            if parent in wildcard_map and ip_set.issubset(wildcard_map[parent]):
+                return True
         return False
 
     to_remove = set()
@@ -125,13 +154,10 @@ def run(ctx):
         massdns_result = massdns_resolve(unresolved, domain)
         if massdns_result is not None:
             for sub in massdns_result:
-                ips = [sub]  # massdns_resolve returns set of names, not IPs
-                # We know it resolved — mark as alive with placeholder
-                if not _is_wildcard(sub, []):
-                    ctx["resolved"][sub] = ["massdns"]
-                    resolved_count += 1
-                else:
-                    ctx["found_subs"].discard(sub)
+                # massdns confirms that hostname resolves, but does not provide
+                # trusted IP data in this code path, so keep a marker value.
+                ctx["resolved"][sub] = ["massdns"]
+                resolved_count += 1
             still_unresolved = [s for s in unresolved if s not in ctx["resolved"]]
             log(f"  massdns: {resolved_count} alive, {len(still_unresolved)} remain")
             unresolved = still_unresolved
@@ -186,6 +212,12 @@ def run(ctx):
     # Removes DNS-poisoned results from dodgy public resolvers
     TRUSTED = ["8.8.8.8", "1.1.1.1"]
     resolved_hosts = list(ctx["resolved"].keys())
+    max_validate = int(os.environ.get("RECON_TRUSTED_VALIDATE_MAX", "15000"))
+    if len(resolved_hosts) > max_validate:
+        # Large runs can stall for a long time here; validate a representative sample.
+        random.shuffle(resolved_hosts)
+        log(f"  Trusted validation capped: {max_validate}/{len(ctx['resolved'])} hosts", "warn")
+        resolved_hosts = resolved_hosts[:max_validate]
     if len(resolved_hosts) > 3:
         try:
             import dns.resolver as _dns_r
