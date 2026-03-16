@@ -724,6 +724,9 @@ def make_context(domain, keys, args):
         "threads": args.threads,
         "timeout": args.timeout,
         "delay": args.delay,
+        "RECON_RECURSIVE_PARENT_MAX": max(50, int(os.environ.get("RECON_RECURSIVE_PARENT_MAX", "300"))),
+        "RECON_RECURSIVE_WILDCARD_PARENT_MAX": max(50, int(os.environ.get("RECON_RECURSIVE_WILDCARD_PARENT_MAX", "300"))),
+        "RECON_WILDCARD_LOG_LIMIT": max(0, int(os.environ.get("RECON_WILDCARD_LOG_LIMIT", "60"))),
 
         # Shared utilities — modules use these, no imports needed
         "get": get,

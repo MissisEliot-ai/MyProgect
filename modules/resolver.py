@@ -16,7 +16,7 @@ DESCRIPTION = "Multi-level wildcard detection + mass DNS resolve"
 
 def run(ctx):
     domain = ctx["domain"]
-    found = ctx["found_subs"]
+    found = set(ctx["found_subs"])
     resolve_one = ctx["resolve_one"]
     log, c = ctx["log"], ctx["c"]
 
@@ -34,9 +34,10 @@ def run(ctx):
                 parents.add(parent)
 
     # Cap parents to prevent slowdown with large wordlists
-    if len(parents) > 1000:
+    parent_cap = max(50, int(os.environ.get("RECON_WILDCARD_PARENT_MAX", "500")))
+    if len(parents) > parent_cap:
         # Keep shortest (most important) parents
-        parents = set(sorted(parents, key=len)[:1000])
+        parents = set(sorted(parents, key=len)[:parent_cap])
 
     log(f"  Checking {len(parents)} zones for wildcards...")
 
@@ -99,8 +100,16 @@ def run(ctx):
 
     if wildcard_map:
         log(f"  Wildcards found at {c(str(len(wildcard_map)),'yellow')} levels:", "warn")
+        ctx["wildcard_parents"] = set(wildcard_map.keys())
+        wc_log_limit = max(0, int(os.environ.get("RECON_WILDCARD_LOG_LIMIT", "60")))
+        shown = 0
         for parent in sorted(wildcard_map.keys()):
+            if wc_log_limit and shown >= wc_log_limit:
+                break
             log(f"    *.{parent} → {wildcard_map[parent]}", "warn")
+            shown += 1
+        if wc_log_limit and len(wildcard_map) > wc_log_limit:
+            log(f"    ... and {len(wildcard_map) - wc_log_limit} more wildcard parents", "warn")
         # Merge all wildcard IPs for ctx
         all_wc_ips = set()
         for ips in wildcard_map.values():
@@ -109,6 +118,7 @@ def run(ctx):
     else:
         log(f"  No wildcards detected ✓")
         ctx["wildcard_ips"] = set()
+        ctx["wildcard_parents"] = set()
 
     # ── 3. Filter already-resolved subs against wildcard parents ──
     def _is_wildcard(sub, ips):
@@ -138,7 +148,7 @@ def run(ctx):
         log(f"  Removed {c(str(len(to_remove)),'yellow')} wildcard subs from resolved")
 
     # ── 4. Mass resolve remaining — massdns first, dnsx second, ThreadPool last ──
-    found = ctx["found_subs"]  # refresh after filtering
+    found = set(ctx["found_subs"])  # refresh after filtering
     unresolved = [s for s in found if s not in ctx["resolved"]]
     if not unresolved:
         log(f"  All {len(found)} subs already resolved")
@@ -165,6 +175,11 @@ def run(ctx):
     # Try dnsx second (gets actual IPs)
     dnsx_resolve = ctx.get("dnsx_resolve")
     if dnsx_resolve and unresolved:
+        dnsx_max_total = max(0, int(os.environ.get("RECON_DNSX_MAX_TOTAL", "120000")))
+        if dnsx_max_total and len(unresolved) > dnsx_max_total:
+            unresolved = sorted(unresolved, key=len)[:dnsx_max_total]
+            log(f"  dnsx capped: {dnsx_max_total} hosts (set RECON_DNSX_MAX_TOTAL=0 to disable)", "warn")
+
         dnsx_batch_size = max(1000, int(os.environ.get("RECON_DNSX_BATCH_SIZE", "50000")))
         total_dnsx = len(unresolved)
         if total_dnsx > dnsx_batch_size:
@@ -173,6 +188,7 @@ def run(ctx):
             log(f"  Using dnsx for {total_dnsx} subs...")
 
         remaining_after_dnsx = []
+        dnsx_resolved = 0
         batch_no = 0
         total_batches = (total_dnsx + dnsx_batch_size - 1) // dnsx_batch_size
 
@@ -192,12 +208,13 @@ def run(ctx):
                     continue
                 ctx["resolved"][sub] = ips
                 resolved_count += 1
+                dnsx_resolved += 1
 
             log(f"  dnsx progress: {min(i + dnsx_batch_size, total_dnsx)}/{total_dnsx} processed", "info")
 
         unresolved = remaining_after_dnsx
         if unresolved:
-            log(f"  dnsx: +{resolved_count} total, {len(unresolved)} remain")
+            log(f"  dnsx: +{dnsx_resolved} alive, {len(unresolved)} remain")
 
     # Fallback: ThreadPool for remaining (small batches only)
     if unresolved and len(unresolved) <= 5000:
@@ -232,7 +249,7 @@ def run(ctx):
     # Removes DNS-poisoned results from dodgy public resolvers
     TRUSTED = ["8.8.8.8", "1.1.1.1"]
     resolved_hosts = list(ctx["resolved"].keys())
-    max_validate = int(os.environ.get("RECON_TRUSTED_VALIDATE_MAX", "15000"))
+    max_validate = int(os.environ.get("RECON_TRUSTED_VALIDATE_MAX", "5000"))
     if len(resolved_hosts) > max_validate:
         # Large runs can stall for a long time here; validate a representative sample.
         random.shuffle(resolved_hosts)
