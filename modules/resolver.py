@@ -165,19 +165,39 @@ def run(ctx):
     # Try dnsx second (gets actual IPs)
     dnsx_resolve = ctx.get("dnsx_resolve")
     if dnsx_resolve and unresolved:
-        log(f"  Using dnsx for {len(unresolved)} subs...")
-        dnsx_result = dnsx_resolve(unresolved, domain)
-        if dnsx_result:
-            for sub, ips in dnsx_result.items():
+        dnsx_batch_size = max(1000, int(os.environ.get("RECON_DNSX_BATCH_SIZE", "50000")))
+        total_dnsx = len(unresolved)
+        if total_dnsx > dnsx_batch_size:
+            log(f"  Using dnsx for {total_dnsx} subs in batches of {dnsx_batch_size}...")
+        else:
+            log(f"  Using dnsx for {total_dnsx} subs...")
+
+        remaining_after_dnsx = []
+        batch_no = 0
+        total_batches = (total_dnsx + dnsx_batch_size - 1) // dnsx_batch_size
+
+        for i in range(0, total_dnsx, dnsx_batch_size):
+            batch_no += 1
+            batch = unresolved[i:i + dnsx_batch_size]
+            log(f"  dnsx batch {batch_no}/{total_batches}: {len(batch)} hosts", "info")
+            dnsx_result = dnsx_resolve(batch, domain) or {}
+
+            for sub in batch:
+                ips = dnsx_result.get(sub)
+                if not ips:
+                    remaining_after_dnsx.append(sub)
+                    continue
                 if _is_wildcard(sub, ips):
                     ctx["found_subs"].discard(sub)
                     continue
                 ctx["resolved"][sub] = ips
                 resolved_count += 1
-            still_unresolved = [s for s in unresolved if s not in ctx["resolved"]]
-            if still_unresolved:
-                log(f"  dnsx: +{len(dnsx_result)}, {len(still_unresolved)} remain")
-            unresolved = still_unresolved
+
+            log(f"  dnsx progress: {min(i + dnsx_batch_size, total_dnsx)}/{total_dnsx} processed", "info")
+
+        unresolved = remaining_after_dnsx
+        if unresolved:
+            log(f"  dnsx: +{resolved_count} total, {len(unresolved)} remain")
 
     # Fallback: ThreadPool for remaining (small batches only)
     if unresolved and len(unresolved) <= 5000:
