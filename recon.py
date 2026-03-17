@@ -839,6 +839,8 @@ def main():
     parser.add_argument("--modules-dir", default=None)
     parser.add_argument("--list-modules", action="store_true")
     parser.add_argument("--only", default=None, help="Run only specific module (by NAME)")
+    parser.add_argument("--phase", type=int, choices=[1,2,3,4], default=None,
+                        help="Run only one phase (1..4)")
     parser.add_argument("--wordlist", default=None, help="Wordlist for root-level DNS brute (e.g. assetnote 1M)")
     args = parser.parse_args()
 
@@ -909,11 +911,16 @@ def main():
     _scan_start = time.time()
     phase_groups = {}
     for mod in modules:
+        if args.phase is not None and getattr(mod, "PHASE", None) != args.phase:
+            continue
         if getattr(mod, "NEEDS_DEEP", False) and not args.deep:
             continue
         if args.only and args.only.lower() != mod.NAME.lower():
             continue
         phase_groups.setdefault(mod.PHASE, []).append(mod)
+
+    if args.phase is not None and not phase_groups:
+        log(f"No modules selected for phase {args.phase}. Try adding --deep for phases 2/3.", "warn")
 
     for phase_num in sorted(phase_groups.keys()):
         phase_mods = phase_groups[phase_num]
