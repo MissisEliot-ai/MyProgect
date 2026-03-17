@@ -11,7 +11,7 @@ PHASE = 2
 PRIORITY = 20
 NEEDS_DEEP = True
 DESCRIPTION = "Recursive DNS brute on every subdomain (BBOT-style)"
-VERSION = "1.2"
+VERSION = "1.3"
 
 # High-probability prefixes — short list, maximum hit rate
 RECURSIVE_WORDS = [

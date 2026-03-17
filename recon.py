@@ -57,7 +57,7 @@ except ImportError:
 # GLOBALS
 # ─────────────────────────────────────────────────────────────
 _LOCKS = {"crtsh": threading.Lock()}
-VERSION = "1.2"
+VERSION = "1.3"
 
 # ─────────────────────────────────────────────────────────────
 # COLORS & LOGGING
@@ -1180,7 +1180,11 @@ def main():
     if args.deep:
         import ssl as _ssl
         _start_recurse = time.time()
-        MAX_RECURSE_TIME = 60  # seconds total
+        MAX_RECURSE_TIME = max(10, int(os.environ.get("RECON_RECURSIVE_LOOP_MAX_TIME", "25")))
+        recursive_ip_probe_max = max(1, int(os.environ.get("RECON_RECURSIVE_IP_PROBE_MAX", "50")))
+        recursive_ct_target_max = max(1, int(os.environ.get("RECON_RECURSIVE_CRT_TARGET_MAX", "3")))
+        recursive_ct_timeout = max(3, int(os.environ.get("RECON_RECURSIVE_CRT_TIMEOUT", "12")))
+        recursive_resolve_max = max(0, int(os.environ.get("RECON_RECURSIVE_RESOLVE_MAX", "3000")))
 
         for loop_round in range(1, 3):
             if time.time() - _start_recurse > MAX_RECURSE_TIME:
@@ -1203,7 +1207,7 @@ def main():
 
             # 1. SSL cert SAN from unique IPs (fast, parallel)
             new_from_ssl = set()
-            ips_to_probe = list(resolved_ips)[:200]  # cap at 200
+            ips_to_probe = list(resolved_ips)[:recursive_ip_probe_max]
 
             def _grab_san(ip):
                 found = set()
@@ -1246,9 +1250,9 @@ def main():
 
             if new_parents and time.time() - _start_recurse < MAX_RECURSE_TIME:
                 crt_new = set()
-                for parent in list(new_parents)[:10]:
+                for parent in list(new_parents)[:recursive_ct_target_max]:
                     try:
-                        crt_results = ctx["crtsh_query"](parent)
+                        crt_results = ctx["crtsh_query"]({"q": f"%.{parent}", "output": "json", "deduplicate": "Y"}, timeout=recursive_ct_timeout)
                         crt_new.update(crt_results - ctx["found_subs"])
                     except Exception:
                         pass
@@ -1259,6 +1263,9 @@ def main():
             # 3. Quick resolve new finds
             new_total = ctx["found_subs"] - set(ctx["resolved"].keys())
             if new_total:
+                if recursive_resolve_max and len(new_total) > recursive_resolve_max:
+                    log(f"  Recursive resolve capped: {recursive_resolve_max}/{len(new_total)} hosts", "warn")
+                    new_total = set(sorted(new_total)[:recursive_resolve_max])
                 resolve_one = ctx["resolve_one"]
                 resolved_count = 0
                 with concurrent.futures.ThreadPoolExecutor(max_workers=80) as ex:

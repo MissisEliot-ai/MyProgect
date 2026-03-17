@@ -14,7 +14,7 @@ PHASE = 3
 PRIORITY = 15
 NEEDS_DEEP = True
 DESCRIPTION = "Predict subdomains from numeric/structural patterns"
-VERSION = "1.2"
+VERSION = "1.3"
 
 # Cloud region patterns (AWS, Azure, GCP style)
 CLOUD_REGIONS = [

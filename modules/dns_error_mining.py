@@ -13,7 +13,7 @@ PHASE = 3
 PRIORITY = 20
 NEEDS_DEEP = True
 DESCRIPTION = "SERVFAIL/REFUSED = hidden hosts that exist"
-VERSION = "1.2"
+VERSION = "1.3"
 
 # High-value internal prefixes to probe
 INTERNAL_WORDS = [

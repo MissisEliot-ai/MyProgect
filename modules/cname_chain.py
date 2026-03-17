@@ -9,7 +9,7 @@ PHASE = 2
 PRIORITY = 40
 NEEDS_DEEP = True
 DESCRIPTION = "CNAME following → hidden infrastructure"
-VERSION = "1.2"
+VERSION = "1.3"
 
 def run(ctx):
     domain = ctx["domain"]

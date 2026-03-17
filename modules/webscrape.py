@@ -11,7 +11,7 @@ PHASE = 2
 PRIORITY = 10
 NEEDS_DEEP = True
 DESCRIPTION = "Parallel HTTP scrape: headers + HTML + JS"
-VERSION = "1.2"
+VERSION = "1.3"
 
 def run(ctx):
     domain = ctx["domain"]

@@ -27,7 +27,7 @@ PHASE = 1
 PRIORITY = 10
 NEEDS_DEEP = False
 DESCRIPTION = "All passive API sources (CT, DNS, search engines)"
-VERSION = "1.2"
+VERSION = "1.3"
 
 # ─────────────────────────────────────────────────────────────
 # Module-level context — set by run(), used by source functions

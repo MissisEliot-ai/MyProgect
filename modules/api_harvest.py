@@ -11,7 +11,7 @@ PHASE = 2
 PRIORITY = 35
 NEEDS_DEEP = True
 DESCRIPTION = "Swagger/OpenAPI/GraphQL → hidden server URLs"
-VERSION = "1.2"
+VERSION = "1.3"
 
 # Paths to probe (ordered by likelihood)
 SPEC_PATHS = [
