@@ -7,6 +7,7 @@ import random
 import string
 import concurrent.futures
 import os
+import re
 
 NAME = "DNS Resolver"
 PHASE = 4
@@ -249,7 +250,18 @@ def run(ctx):
     # Re-check all resolved hosts against 8.8.8.8 and 1.1.1.1
     # Removes DNS-poisoned results from dodgy public resolvers
     TRUSTED = ["8.8.8.8", "1.1.1.1"]
-    resolved_hosts = list(ctx["resolved"].keys())
+    ipv4_re = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+    # Validate only entries with real IP evidence; skip synthetic markers like ["massdns"].
+    resolved_hosts = []
+    for sub, ips in ctx["resolved"].items():
+        ip_list = ips if isinstance(ips, (list, tuple, set)) else ([ips] if ips else [])
+        if any(isinstance(ip, str) and ipv4_re.match(ip.strip()) for ip in ip_list):
+            resolved_hosts.append(sub)
+
+    skipped_markers = len(ctx["resolved"]) - len(resolved_hosts)
+    if skipped_markers:
+        log(f"  Trusted validation: skipped {skipped_markers} marker-only hosts", "info")
+
     max_validate = int(os.environ.get("RECON_TRUSTED_VALIDATE_MAX", "5000"))
     if len(resolved_hosts) > max_validate:
         # Large runs can stall for a long time here; validate a representative sample.
@@ -293,7 +305,11 @@ def run(ctx):
         if len(resolved_hosts) > 500:
             print()
 
-        if poisoned:
+        # If trusted resolvers fail for almost everything, likely resolver/network issue.
+        # Do not wipe results in this case.
+        if resolved_hosts and len(poisoned) / max(1, len(resolved_hosts)) >= 0.90:
+            log("  Trusted validation unstable (>=90% failures), skipping poison cleanup", "warn")
+        elif poisoned:
             for sub in poisoned:
                 ctx["resolved"].pop(sub, None)
                 ctx["found_subs"].discard(sub)
