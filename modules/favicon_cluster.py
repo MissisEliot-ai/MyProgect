@@ -14,6 +14,7 @@ PHASE = 2
 PRIORITY = 45
 NEEDS_DEEP = True
 DESCRIPTION = "Favicon hash → find related infrastructure"
+VERSION = "1.3"
 
 def _mmh3_32(data):
     """MurmurHash3 32-bit (pure Python, no dependency)."""
