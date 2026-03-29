@@ -11,6 +11,7 @@ PHASE = 2
 PRIORITY = 20
 NEEDS_DEEP = True
 DESCRIPTION = "Recursive DNS brute on every subdomain (BBOT-style)"
+VERSION = "1.3"
 
 # High-probability prefixes — short list, maximum hit rate
 RECURSIVE_WORDS = [
@@ -32,7 +33,7 @@ RECURSIVE_WORDS = [
 
 def run(ctx):
     domain = ctx["domain"]
-    found = ctx["found_subs"]
+    found = set(ctx["found_subs"])
     resolve_one = ctx["resolve_one"]
     massdns_resolve = ctx["massdns_resolve"]
     crtsh_query = ctx["crtsh_query"]
@@ -57,9 +58,10 @@ def run(ctx):
         parents_to_check.add(sub)
     parents_to_check.add(domain)
 
-    # Cap: only check 500 shortest parents (rest are wordlist noise)
-    if len(parents_to_check) > 500:
-        parents_to_check = set(sorted(parents_to_check, key=len)[:500])
+    # Cap: only check shortest parents (rest are wordlist noise)
+    wc_parent_cap = max(50, int(ctx.get("RECON_RECURSIVE_WILDCARD_PARENT_MAX", 300)))
+    if len(parents_to_check) > wc_parent_cap:
+        parents_to_check = set(sorted(parents_to_check, key=len)[:wc_parent_cap])
 
     def _wc_check(parent):
         rand = ''.join(_rnd.choices(_str.ascii_lowercase, k=12))
@@ -84,9 +86,17 @@ def run(ctx):
                 ctx.setdefault("wildcard_ips", set()).update(wc_ips)
 
     if wildcard_parents:
+        ctx.setdefault("wildcard_parents", set()).update(wildcard_parents)
         log(f"  Wildcard parents ({c(str(len(wildcard_parents)),'yellow')}): skipping brute on these", "warn")
+        wc_log_limit = max(0, int(ctx.get("RECON_WILDCARD_LOG_LIMIT", 60)))
+        shown = 0
         for wp in sorted(wildcard_parents):
+            if wc_log_limit and shown >= wc_log_limit:
+                break
             log(f"    *.{wp}", "warn")
+            shown += 1
+        if wc_log_limit and len(wildcard_parents) > wc_log_limit:
+            log(f"    ... and {len(wildcard_parents) - wc_log_limit} more wildcard parents", "warn")
 
     # ──────────────────────────────────────────
     # STEP 1: Build candidates — SKIP wildcard parents
@@ -101,9 +111,10 @@ def run(ctx):
             continue
         parents.append(sub)
 
-    # Cap to 500 parents — beyond that, wordlist brute already covers them
-    if len(parents) > 500:
-        parents = sorted(parents, key=len)[:500]
+    # Cap parents — beyond that, root wordlist brute already covers them
+    recursive_parent_cap = max(50, int(ctx.get("RECON_RECURSIVE_PARENT_MAX", 300)))
+    if len(parents) > recursive_parent_cap:
+        parents = sorted(parents, key=len)[:recursive_parent_cap]
 
     for sub in parents:
         for word in RECURSIVE_WORDS:

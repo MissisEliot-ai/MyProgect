@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -56,6 +57,7 @@ except ImportError:
 # GLOBALS
 # ─────────────────────────────────────────────────────────────
 _LOCKS = {"crtsh": threading.Lock()}
+VERSION = "1.3"
 
 # ─────────────────────────────────────────────────────────────
 # COLORS & LOGGING
@@ -203,14 +205,28 @@ def crtsh_extract(data, domain):
 RESOLVERS = ["8.8.8.8","1.1.1.1","9.9.9.9","208.67.222.222","8.8.4.4",
              "1.0.0.1","149.112.112.112","208.67.220.220"]
 
+def _candidate_resolver_files():
+    """Return resolver file paths in lookup order."""
+    root = Path(__file__).parent
+    return [
+        root / "resolvers.txt",              # legacy location (next to recon.py)
+        root / "modules" / "resolvers.txt", # current project layout
+    ]
+
+
 def load_resolvers():
-    """Load resolvers from resolvers.txt if exists."""
+    """Load resolvers from resolvers.txt if it exists in known locations."""
     global RESOLVERS
-    rfile = Path(__file__).parent / "resolvers.txt"
-    if rfile.exists():
+    for rfile in _candidate_resolver_files():
+        if not rfile.exists():
+            continue
         loaded = [l.strip() for l in rfile.read_text().splitlines() if l.strip() and not l.startswith("#")]
         if loaded:
             RESOLVERS = loaded
+            dbg(f"Loaded {len(loaded)} resolvers from {rfile}")
+            return str(rfile)
+    dbg("No resolvers.txt found in known locations, using built-in defaults")
+    return None
 
 load_resolvers()
 
@@ -269,25 +285,19 @@ def massdns_resolve(candidates, domain, resolvers_file=None):
     """Bulk resolve via massdns if installed. Returns set of resolved subdomains.
     Falls back to None if massdns not available."""
     if resolvers_file is None:
-        resolvers_file = str(Path(__file__).parent / "resolvers.txt")
-    if not Path(resolvers_file).exists():
+        for candidate in _candidate_resolver_files():
+            if candidate.exists():
+                resolvers_file = str(candidate)
+                break
+    if not resolvers_file or not Path(resolvers_file).exists():
+        dbg("massdns skipped: resolvers.txt not found")
         return None
 
-    # Find massdns binary — check local dir first, then PATH
-    massdns_bin = None
-    script_dir = Path(__file__).parent
-    for name in ["massdns.exe", "massdns"]:
-        local = script_dir / name
-        if local.exists():
-            massdns_bin = str(local)
-            break
+    # Find massdns binary with shared detection logic
+    massdns_bin = find_binary("massdns")
     if massdns_bin is None:
-        try:
-            subprocess.run(["massdns", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            massdns_bin = "massdns"
-        except (FileNotFoundError, Exception):
-            dbg("massdns not found in PATH or local directory")
-            return None
+        dbg("massdns not found in known tool dirs or PATH")
+        return None
 
     dbg(f"massdns found: {massdns_bin}")
 
@@ -333,18 +343,50 @@ def massdns_resolve(candidates, domain, resolvers_file=None):
 # ─────────────────────────────────────────────────────────────
 # EXTERNAL TOOL DETECTION + INTEGRATION
 # ─────────────────────────────────────────────────────────────
+def _tool_search_dirs():
+    """Directories to scan for external tools (Windows-friendly)."""
+    root = Path(__file__).parent
+    dirs = [
+        root,
+        root / "tools",
+        root / "bin",
+        root / "modules" / "tools",
+    ]
+    # Optional custom dirs: RECON_TOOLS_DIR="C:\tools;D:\sec" on Windows
+    env_dirs = os.environ.get("RECON_TOOLS_DIR", "")
+    if env_dirs:
+        for raw in env_dirs.split(os.pathsep):
+            raw = raw.strip().strip('"')
+            if raw:
+                dirs.append(Path(raw))
+    # keep order, drop duplicates
+    seen = set()
+    uniq = []
+    for d in dirs:
+        key = str(d.resolve()) if d.exists() else str(d)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(d)
+    return uniq
+
+
 def find_binary(name):
-    """Find binary in script dir first, then PATH. Returns path or None."""
-    script_dir = Path(__file__).parent
-    for ext in [".exe", ""]:
-        local = script_dir / (name + ext)
-        if local.exists():
-            return str(local)
-    try:
-        subprocess.run([name, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-        return name
-    except (FileNotFoundError, Exception):
-        return None
+    """Find binary in project dirs first, then PATH. Returns path or None."""
+    exts = [".exe", ".bat", ".cmd", ""] if os.name == "nt" else [""]
+
+    # 1) Project-local locations (portable bundles)
+    for d in _tool_search_dirs():
+        for ext in exts:
+            local = d / (name + ext)
+            if local.exists() and local.is_file():
+                return str(local)
+
+    # 2) PATH via shutil.which (supports PATHEXT on Windows)
+    for ext in exts:
+        hit = shutil.which(name + ext)
+        if hit:
+            return hit
+    return None
 
 # Detect all binaries at import time
 BIN_DNSX = find_binary("dnsx")
@@ -683,6 +725,9 @@ def make_context(domain, keys, args):
         "threads": args.threads,
         "timeout": args.timeout,
         "delay": args.delay,
+        "RECON_RECURSIVE_PARENT_MAX": max(50, int(os.environ.get("RECON_RECURSIVE_PARENT_MAX", "300"))),
+        "RECON_RECURSIVE_WILDCARD_PARENT_MAX": max(50, int(os.environ.get("RECON_RECURSIVE_WILDCARD_PARENT_MAX", "300"))),
+        "RECON_WILDCARD_LOG_LIMIT": max(0, int(os.environ.get("RECON_WILDCARD_LOG_LIMIT", "60"))),
 
         # Shared utilities — modules use these, no imports needed
         "get": get,
@@ -794,6 +839,8 @@ def main():
     parser.add_argument("--modules-dir", default=None)
     parser.add_argument("--list-modules", action="store_true")
     parser.add_argument("--only", default=None, help="Run only specific module (by NAME)")
+    parser.add_argument("--phase", type=int, choices=[1,2,3,4], default=None,
+                        help="Run only one phase (1..4)")
     parser.add_argument("--wordlist", default=None, help="Wordlist for root-level DNS brute (e.g. assetnote 1M)")
     args = parser.parse_args()
 
@@ -864,11 +911,16 @@ def main():
     _scan_start = time.time()
     phase_groups = {}
     for mod in modules:
+        if args.phase is not None and getattr(mod, "PHASE", None) != args.phase:
+            continue
         if getattr(mod, "NEEDS_DEEP", False) and not args.deep:
             continue
         if args.only and args.only.lower() != mod.NAME.lower():
             continue
         phase_groups.setdefault(mod.PHASE, []).append(mod)
+
+    if args.phase is not None and not phase_groups:
+        log(f"No modules selected for phase {args.phase}. Try adding --deep for phases 2/3.", "warn")
 
     for phase_num in sorted(phase_groups.keys()):
         phase_mods = phase_groups[phase_num]
@@ -950,11 +1002,13 @@ def main():
                 wl_found = set()
                 est_lines = int(wl_size_mb * 100000)
                 wl_timeout = max(300, int(est_lines / 2000))
-                resolvers_file = str(Path(__file__).parent / "resolvers.txt")
+                resolvers_file = next((str(p) for p in _candidate_resolver_files() if p.exists()), "")
+                if not resolvers_file:
+                    log(f"  Wordlist brute: resolvers.txt not found, massdns skipped", "warn")
 
                 # === Strategy 1: massdns (OneForAll-style flags) ===
                 massdns_bin = find_binary("massdns")
-                if massdns_bin:
+                if massdns_bin and resolvers_file:
                     log(f"  Using massdns (timeout: {wl_timeout}s)...", "info")
                     output_file = candidates_file + ".out"
                     try:
@@ -1133,7 +1187,11 @@ def main():
     if args.deep:
         import ssl as _ssl
         _start_recurse = time.time()
-        MAX_RECURSE_TIME = 60  # seconds total
+        MAX_RECURSE_TIME = max(10, int(os.environ.get("RECON_RECURSIVE_LOOP_MAX_TIME", "25")))
+        recursive_ip_probe_max = max(1, int(os.environ.get("RECON_RECURSIVE_IP_PROBE_MAX", "50")))
+        recursive_ct_target_max = max(1, int(os.environ.get("RECON_RECURSIVE_CRT_TARGET_MAX", "3")))
+        recursive_ct_timeout = max(3, int(os.environ.get("RECON_RECURSIVE_CRT_TIMEOUT", "12")))
+        recursive_resolve_max = max(0, int(os.environ.get("RECON_RECURSIVE_RESOLVE_MAX", "3000")))
 
         for loop_round in range(1, 3):
             if time.time() - _start_recurse > MAX_RECURSE_TIME:
@@ -1156,7 +1214,7 @@ def main():
 
             # 1. SSL cert SAN from unique IPs (fast, parallel)
             new_from_ssl = set()
-            ips_to_probe = list(resolved_ips)[:200]  # cap at 200
+            ips_to_probe = list(resolved_ips)[:recursive_ip_probe_max]
 
             def _grab_san(ip):
                 found = set()
@@ -1199,9 +1257,9 @@ def main():
 
             if new_parents and time.time() - _start_recurse < MAX_RECURSE_TIME:
                 crt_new = set()
-                for parent in list(new_parents)[:10]:
+                for parent in list(new_parents)[:recursive_ct_target_max]:
                     try:
-                        crt_results = ctx["crtsh_query"](parent)
+                        crt_results = ctx["crtsh_query"]({"q": f"%.{parent}", "output": "json", "deduplicate": "Y"}, timeout=recursive_ct_timeout)
                         crt_new.update(crt_results - ctx["found_subs"])
                     except Exception:
                         pass
@@ -1212,6 +1270,9 @@ def main():
             # 3. Quick resolve new finds
             new_total = ctx["found_subs"] - set(ctx["resolved"].keys())
             if new_total:
+                if recursive_resolve_max and len(new_total) > recursive_resolve_max:
+                    log(f"  Recursive resolve capped: {recursive_resolve_max}/{len(new_total)} hosts", "warn")
+                    new_total = set(sorted(new_total)[:recursive_resolve_max])
                 resolve_one = ctx["resolve_one"]
                 resolved_count = 0
                 with concurrent.futures.ThreadPoolExecutor(max_workers=80) as ex:
@@ -1300,60 +1361,176 @@ def main():
         http_info = {}   # {host: [(status, url), ...]}
         dead_codes = {0, 404, 502, 503, 521, 522, 523, 530}
 
-        # Write alive to temp file for httpx
-        import tempfile
-        tmp_in = os.path.join(out_dir, "_probe_in.txt")
-        save_txt(tmp_in, alive)
-
-        # Try httpx first (1000+/min)
+        # Try fast HTTP prober first (httpx by default, optional httprobe)
+        prober_mode = os.environ.get("RECON_HTTP_PROBER", "httpx").strip().lower()
         httpx_bin = BIN_HTTPX
+        httprobe_bin = find_binary("httprobe")
+        httpx_attempted = False
+        httpx_failed = False
 
-        if httpx_bin:
+        if prober_mode in ("httprobe", "auto") and httprobe_bin:
+            probe_max = int(os.environ.get("RECON_HTTP_PROBE_MAX", "0"))
+            probe_set = list(sorted(alive))
+            if probe_max > 0 and len(probe_set) > probe_max:
+                log(f"  HTTP probe capped: {probe_max}/{len(probe_set)} hosts", "warn")
+                probe_set = probe_set[:probe_max]
+
+            httprobe_batch_size = max(1000, int(os.environ.get("RECON_HTTPX_BATCH_SIZE", "50000")))
+            httprobe_batch_timeout = max(120, int(os.environ.get("RECON_HTTPX_BATCH_TIMEOUT", "600")))
+            total_probe = len(probe_set)
+            total_batches = (total_probe + httprobe_batch_size - 1) // httprobe_batch_size
+            log(f"  httprobe found: {httprobe_bin}", "info")
+
+            try:
+                httpx_attempted = True
+                for bi in range(total_batches):
+                    batch = probe_set[bi*httprobe_batch_size:(bi+1)*httprobe_batch_size]
+                    log(f"  httprobe batch {bi+1}/{total_batches}: {len(batch)} hosts", "info")
+
+                    tmp_in = os.path.join(out_dir, f"_probe_in_{bi}.txt")
+                    tmp_out = os.path.join(out_dir, f"_probe_out_{bi}.txt")
+                    save_txt(tmp_in, batch)
+
+                    subprocess.run([
+                        httprobe_bin,
+                        "-c", os.environ.get("RECON_HTTPX_THREADS", "200"),
+                        "-t", os.environ.get("RECON_HTTPX_TIMEOUT", "3000"),
+                        "-p", "https:443",
+                        "-p", "http:80",
+                        "-i", tmp_in,
+                        "-o", tmp_out
+                    ], timeout=httprobe_batch_timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    if Path(tmp_out).exists():
+                        with open(tmp_out) as f:
+                            for line in f:
+                                url = line.strip()
+                                if not url:
+                                    continue
+                                host_part = url.replace("https://", "").replace("http://", "").split("/")[0]
+                                host = host_part.split(":")[0]
+                                if host.endswith("." + domain) or host == domain:
+                                    http_info.setdefault(host, []).append((200, url))
+                                    http_alive.add(url)
+
+                    log(f"  httprobe progress: {min((bi+1)*httprobe_batch_size, total_probe)}/{total_probe}", "info")
+                    for fpath in (tmp_in, tmp_out):
+                        try: Path(fpath).unlink()
+                        except OSError: pass
+            except Exception as e:
+                httpx_failed = True
+                dbg(f"httprobe error: {e}")
+
+        elif httpx_bin:
             log(f"  httpx found: {httpx_bin}", "info")
             # Probe top web ports — finds hidden services on 8080, 8443, etc.
             PROBE_PORTS = "80,443,8080,8443,8888,9090,3000,4443,8000"
             log(f"  Ports: {PROBE_PORTS}", "info")
-            tmp_out = os.path.join(out_dir, "_probe_out.txt")
+
+            # Optional safety cap for very large runs
+            probe_max = int(os.environ.get("RECON_HTTP_PROBE_MAX", "0"))
+            probe_set = list(sorted(alive))
+            if probe_max > 0 and len(probe_set) > probe_max:
+                log(f"  HTTP probe capped: {probe_max}/{len(probe_set)} hosts", "warn")
+                probe_set = probe_set[:probe_max]
+
+            httpx_batch_size = max(1000, int(os.environ.get("RECON_HTTPX_BATCH_SIZE", "50000")))
+            httpx_batch_timeout = max(120, int(os.environ.get("RECON_HTTPX_BATCH_TIMEOUT", "600")))
+            httpx_threads = max(10, int(os.environ.get("RECON_HTTPX_THREADS", "200")))
+            httpx_rl = max(10, int(os.environ.get("RECON_HTTPX_RATE", "1000")))
+            httpx_timeout = max(1, int(os.environ.get("RECON_HTTPX_TIMEOUT", "3")))
+            httpx_retries = max(0, int(os.environ.get("RECON_HTTPX_RETRIES", "0")))
+            httpx_nfs = os.environ.get("RECON_HTTPX_NFS", "1") == "1"
+            httpx_scheme_mode = os.environ.get("RECON_HTTPX_SCHEME_MODE", "host").strip().lower()
+            total_probe = len(probe_set)
+            total_batches = (total_probe + httpx_batch_size - 1) // httpx_batch_size
+
+            import tempfile
             try:
-                # Run WITHOUT -fc — capture ALL responses for http_full
-                subprocess.run([
-                    httpx_bin, "-l", tmp_in, "-o", tmp_out,
-                    "-t", "100", "-timeout", "3",
-                    "-p", PROBE_PORTS,
-                    "-sc", "-silent", "-no-color"
-                ], timeout=600, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if Path(tmp_out).exists():
-                    with open(tmp_out) as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            url = line.split(" [")[0].strip() if " [" in line else line
-                            status = 0
-                            if " [" in line:
-                                try:
-                                    status = int(line.split(" [")[1].rstrip("]").strip())
-                                except ValueError:
-                                    pass
-                            host_part = url.replace("https://", "").replace("http://", "").split("/")[0]
-                            host = host_part.split(":")[0]
-                            if host.endswith("." + domain) or host == domain:
-                                # ALL go to http_info (for http_full.txt)
-                                http_info.setdefault(host, []).append((status, url))
-                                # Only non-dead go to http_alive
-                                if status and status not in dead_codes:
-                                    http_alive.add(url)
-                    try: Path(tmp_out).unlink()
-                    except OSError: pass
+                httpx_attempted = True
+                for bi in range(total_batches):
+                    batch = probe_set[bi*httpx_batch_size:(bi+1)*httpx_batch_size]
+                    log(f"  httpx batch {bi+1}/{total_batches}: {len(batch)} hosts", "info")
+
+                    tmp_in = os.path.join(out_dir, f"_probe_in_{bi}.txt")
+                    tmp_out = os.path.join(out_dir, f"_probe_out_{bi}.txt")
+                    if httpx_scheme_mode in ("https", "http", "both"):
+                        prepared = []
+                        for host in batch:
+                            if httpx_scheme_mode in ("https", "both"):
+                                prepared.append(f"https://{host}")
+                            if httpx_scheme_mode in ("http", "both"):
+                                prepared.append(f"http://{host}")
+                        save_txt(tmp_in, prepared)
+                    else:
+                        save_txt(tmp_in, batch)
+
+                    # Run WITHOUT -fc — capture ALL responses for http_full
+                    cmd = [
+                        httpx_bin, "-l", tmp_in, "-o", tmp_out,
+                        "-t", str(httpx_threads),
+                        "-rl", str(httpx_rl),
+                        "-timeout", str(httpx_timeout),
+                        "-retries", str(httpx_retries),
+                        "-p", PROBE_PORTS,
+                        "-sc", "-silent", "-no-color"
+                    ]
+                    if httpx_nfs and httpx_scheme_mode in ("https", "http", "both"):
+                        cmd.append("-nfs")
+                    subprocess.run(cmd, timeout=httpx_batch_timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    if Path(tmp_out).exists():
+                        with open(tmp_out) as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                url = line.split(" [")[0].strip() if " [" in line else line
+                                status = 0
+                                if " [" in line:
+                                    try:
+                                        status = int(line.split(" [")[1].rstrip("]").strip())
+                                    except ValueError:
+                                        pass
+                                host_part = url.replace("https://", "").replace("http://", "").split("/")[0]
+                                host = host_part.split(":")[0]
+                                if host.endswith("." + domain) or host == domain:
+                                    # ALL go to http_info (for http_full.txt)
+                                    http_info.setdefault(host, []).append((status, url))
+                                    # Only non-dead go to http_alive
+                                    if status and status not in dead_codes:
+                                        http_alive.add(url)
+
+                    log(f"  httpx progress: {min((bi+1)*httpx_batch_size, total_probe)}/{total_probe}", "info")
+                    for fpath in (tmp_in, tmp_out):
+                        try: Path(fpath).unlink()
+                        except OSError: pass
             except Exception as e:
+                httpx_failed = True
                 dbg(f"httpx error: {e}")
-        
+
         # Fallback: fast HEAD requests, 100 threads, 2s timeout
-        # Calculate which hosts haven't been probed yet
+        # Avoid huge fallback scans when httpx already ran but returned nothing.
         probed_hosts = set(http_info.keys())
-        if not httpx_bin or not probed_hosts:
+        force_head_after_httpx = os.environ.get("RECON_HEAD_PROBE_ON_HTTPX_EMPTY", "0") == "1"
+        head_on_httpx_fail = os.environ.get("RECON_HEAD_ON_HTTPX_FAIL", "0") == "1"
+        do_head_probe = (not httpx_bin) or (not probed_hosts and (not httpx_attempted or force_head_after_httpx or (httpx_failed and head_on_httpx_fail)))
+        if do_head_probe:
             remaining = alive - probed_hosts if probed_hosts else alive
-            log(f"  HEAD probe {len(remaining)} hosts (100 threads, 2s timeout)...", "info")
+
+            # Safety: never fan-out to huge HEAD fallback unless explicitly forced.
+            head_fallback_total_max = max(0, int(os.environ.get("RECON_HEAD_FALLBACK_TOTAL_MAX", "50000")))
+            if httpx_bin and not force_head_after_httpx and head_fallback_total_max > 0 and len(remaining) > head_fallback_total_max:
+                log(f"  HEAD fallback skipped: {len(remaining)} hosts is too large (limit {head_fallback_total_max}); use httpx tuning or set RECON_HEAD_PROBE_ON_HTTPX_EMPTY=1", "warn")
+                remaining = set()
+
+            head_probe_max = max(0, int(os.environ.get("RECON_HEAD_PROBE_MAX", "5000")))
+            if head_probe_max > 0 and len(remaining) > head_probe_max:
+                log(f"  HEAD probe capped: {head_probe_max}/{len(remaining)} hosts", "warn")
+                remaining = set(sorted(remaining)[:head_probe_max])
+
+            if remaining:
+                log(f"  HEAD probe {len(remaining)} hosts (100 threads, 2s timeout)...", "info")
 
             if HAS_REQUESTS:
                 _session = _requests.Session()
@@ -1391,6 +1568,11 @@ def main():
                         http_info.setdefault(sub, []).append((status, url))
             if len(remaining) > 200:
                 print()
+        elif httpx_bin and not probed_hosts:
+            if httpx_failed:
+                log("  HEAD fallback skipped after httpx failure (set RECON_HEAD_ON_HTTPX_FAIL=1 to enable)", "warn")
+            else:
+                log("  HEAD fallback skipped (httpx returned no hosts); set RECON_HEAD_PROBE_ON_HTTPX_EMPTY=1 to force", "warn")
 
         # http_alive.txt — only good URLs (open in browser)
         p_http = os.path.join(out_dir, "http_alive.txt")
@@ -1409,8 +1591,7 @@ def main():
                     total_urls += 1
         log(f"  {c(p_full,'cyan')} — {total_urls} URLs (все ответы, включая 5xx)", "info")
 
-        try: Path(tmp_in).unlink()
-        except OSError: pass
+        # temp probe files are cleaned per-batch above
     elif alive and not args.probe:
         log(f"  Совет: {c('--probe','bold')} для HTTP проверки alive хостов", "info")
 
